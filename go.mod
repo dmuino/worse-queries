@@ -2,11 +2,11 @@ module worseQueries
 
 go 1.21.3
 
-replace stash.corp.netflix.com/cldmta/clickhouse-agent-libs => ../clickhouse-agent-libs
+replace github.com/dmuino/clickhouse-agent-libs => ../clickhouse-agent-libs
 
 require (
 	github.com/google/uuid v1.6.0
-	stash.corp.netflix.com/cldmta/clickhouse-agent-libs v0.1.23
+	github.com/dmuino/clickhouse-agent-libs v0.1.23
 )
 
 require (
