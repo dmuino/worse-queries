@@ -6,9 +6,10 @@ import (
 	"fmt"
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/google/uuid"
-	"math/rand"
 	"os"
+	"os/exec"
 	"regexp"
+	"slices"
 	chagent "stash.corp.netflix.com/cldmta/clickhouse-agent-libs"
 	"time"
 )
@@ -36,6 +37,7 @@ type ResultMetadata struct {
 
 var queriesToIds = make(map[string]string)
 var idsToQueries = make(map[string]string)
+var idsToMeta = make(map[string]QueryMeta)
 
 var connections = make(map[string]*sql.DB)
 
@@ -63,7 +65,7 @@ func getConnection(node chagent.InstanceInfo) *sql.DB {
 
 const OldSettings = "SETTINGS enable_positional_arguments = 1, log_queries = 1, skip_unavailable_shards = 1"
 const NewSettings = OldSettings +
-	", max_parallel_replicas = 16, allow_experimental_parallel_reading_from_replicas = 1" +
+	", max_parallel_replicas = 100, allow_experimental_parallel_reading_from_replicas = 1" +
 	", use_hedged_requests = 0, cluster_for_parallel_replicas = 'default'"
 
 func withFixedTableName(query string, isNew bool) string {
@@ -72,11 +74,11 @@ func withFixedTableName(query string, isNew bool) string {
 	q := query
 	if isNew {
 		settings = NewSettings
+		// replace the table name with one that does not have the _distributed suffix
+		p := regexp.MustCompile(`FROM (insight_\w+)_distributed`)
+		q = p.ReplaceAllString(q, "FROM ${1}_prod")
 	} else {
 		settings = OldSettings
-		// replace the table name with one that has a _distributed suffix
-		p := regexp.MustCompile(`FROM (insight_\w+)`)
-		q = p.ReplaceAllString(q, "FROM ${1}_distributed")
 	}
 	return q + " " + settings
 }
@@ -174,8 +176,9 @@ func sendQueryToCluster(node chagent.InstanceInfo, isNew bool, query string) Res
 	return Results{queryId, allMetadata}
 }
 
-func analyzeQueries(node chagent.InstanceInfo, isNew bool, queries map[QueryMeta][]string) map[QueryMeta][]Results {
+func analyzeQueries(node chagent.InstanceInfo, isNew bool, queries map[QueryMeta][]string) (map[QueryMeta][]Results, map[string]time.Duration) {
 	result := make(map[QueryMeta][]Results)
+	queryTimes := make(map[string]time.Duration)
 	oldNew := "old"
 	if isNew {
 		oldNew = "new"
@@ -186,42 +189,50 @@ func analyzeQueries(node chagent.InstanceInfo, isNew bool, queries map[QueryMeta
 			oldNew,
 			queryMeta.Table, queryTypeStr(queryMeta.Type))
 		for _, query := range queryList {
+			startTime := time.Now()
 			resultMeta := sendQueryToCluster(node, isNew, query)
+			queryId := resultMeta.queryId
+			elapsed := time.Since(startTime)
+			queryTimes[queryId] = elapsed
 			result[queryMeta] = append(result[queryMeta], resultMeta)
 		}
 	}
-	return result
+	return result, queryTimes
 }
 
 func writeResults(oldNew string, results map[QueryMeta][]Results) error {
 	// create results/old or results/new directory
-	dir := fmt.Sprintf("results/%s", oldNew)
-	err := os.MkdirAll(dir, 0755)
-	if err != nil {
-		return err
-	}
+	isNew := oldNew == "new"
 
 	for queryMeta, queryResults := range results {
 		if len(queryResults) == 0 {
 			logger.Infof("No results for table %s of type %s", queryMeta.Table, queryTypeStr(queryMeta.Type))
 			continue
 		}
-		fileName := fmt.Sprintf("%s/%s_%s.txt", dir, queryMeta.Table, queryTypeStr(queryMeta.Type))
-		file, err := os.Create(fileName)
+		dir := getDirForQuery(queryMeta, isNew)
+		err := os.MkdirAll(dir, 0755)
 		if err != nil {
 			return err
 		}
 		for _, result := range queryResults {
-			_, _ = file.WriteString(fmt.Sprintf("Query ID: %s -- %s\n", result.queryId, idsToQueries[result.queryId]))
+			fileName := fmt.Sprintf("%s/%s.txt", dir, result.queryId)
+			file, err := os.Create(fileName)
+			if err != nil {
+				return err
+			}
+
+			query := withFixedTableName(idsToQueries[result.queryId], isNew)
+			_, _ = file.WriteString("------------------------------\n")
+			_, _ = file.WriteString(fmt.Sprintf("Query ID: %s -- %s\n", result.queryId, query))
 			for _, r := range result.perHost {
 				_, _ = file.WriteString(fmt.Sprintf("Hostname: %s\n", r.hostname))
 				_, _ = file.WriteString(fmt.Sprintf("Read Rows: %d\n", r.readRows))
 				_, _ = file.WriteString(fmt.Sprintf("Read Bytes: %d\n", r.readBytes))
 				_, _ = file.WriteString(fmt.Sprintf("Query Duration: %s\n", r.queryDuration))
-				_, _ = file.WriteString(fmt.Sprintf("Profile Events: %v\n", r.profileEvents))
+				_, _ = file.WriteString(fmt.Sprintf("Profile Events: %v\n------\n", r.profileEvents))
 			}
+			_ = file.Close()
 		}
-		_ = file.Close()
 	}
 	return nil
 }
@@ -232,16 +243,14 @@ func selectRandomQueries(queryList []string, max int) []string {
 		return queryList
 	}
 
-	// shuffle the slice
-	rand.Shuffle(len(queryList), func(i, j int) {
-		queryList[i], queryList[j] = queryList[j], queryList[i]
-	})
-
+	slices.Reverse(queryList)
 	return queryList[:max]
 }
 
 func main() {
 	env := chagent.NewNetflixEnv()
+	env.Environment = "prod"
+	env.Account = "iepprod"
 	slotInfo := chagent.NewSlotInfo(env)
 	slotInfo.SetLevel(chagent.DEBUG)
 
@@ -264,20 +273,20 @@ func main() {
 			queryTypeStr(queryMeta.Type))
 	}
 
-	const MaxQueriesPerType = 1
+	const MaxQueriesPerType = 3
 	for queryMeta, queryList := range queries {
-		queries[queryMeta] = selectRandomQueries(queryList, MaxQueriesPerType)
+		maxNumber := MaxQueriesPerType
+		if queryMeta.Type == QueryTypeFilter || queryMeta.Type == QueryTypeFilterTags {
+			maxNumber *= 2
+		}
+		queries[queryMeta] = selectRandomQueries(queryList, maxNumber)
 	}
 
-	analyzedOldQueries := analyzeQueries(oldNode, false, queries)
-	analyzedNewQueries := analyzeQueries(newNode, true, queries)
-
-	for queryMeta, queryList := range queries {
-		fmt.Printf("Table: %s, Type: %s\n", queryMeta.Table, queryTypeStr(queryMeta.Type))
-		for _, query := range queryList {
-			fmt.Printf("%s\n", query)
-			fmt.Printf("Query ID: %s\n", queriesToIds[query])
-
+	analyzedOldQueries, oldTimes := analyzeQueries(oldNode, false, queries)
+	analyzedNewQueries, newTimes := analyzeQueries(newNode, true, queries)
+	for queryMeta, queryResults := range analyzedOldQueries {
+		for _, queryResult := range queryResults {
+			idsToMeta[queryResult.queryId] = queryMeta
 		}
 	}
 
@@ -290,4 +299,84 @@ func main() {
 	if err != nil {
 		logger.Fatalf("Error writing new results: %s", err)
 	}
+
+	logger.Infof("-----------------------------")
+	// print the times for each query
+	file, err := os.Create("results/summary.txt")
+	if err != nil {
+		logger.Fatalf("Error creating summary file: %s", err)
+	}
+	for queryId, oldTime := range oldTimes {
+		newTime, ok := newTimes[queryId]
+		if !ok {
+			logger.Errorf("No time found for queryId: %s", queryId)
+			continue
+		}
+		meta, ok := idsToMeta[queryId]
+		if !ok {
+			logger.Errorf("No metadata found for queryId: %s", queryId)
+			continue
+		}
+		name := fmt.Sprintf("%s_%s/%s", meta.Table, queryTypeStr(meta.Type), queryId)
+		logger.Infof("Query: %s - Old: %s, New: %s", name, oldTime, newTime)
+		_, _ = file.WriteString(fmt.Sprintf("Query: %s - Old: %s, New: %s\n", name, oldTime, newTime))
+	}
+	_ = file.Close()
+	// sleep 1 min
+	logger.Infof("Sleeping for 1 minute to allow the logs to be written to our backend")
+	time.Sleep(1 * time.Minute)
+
+	writeLogs(false, analyzedOldQueries)
+	writeLogs(true, analyzedNewQueries)
+
+}
+
+func writeLogs(isNew bool, analyzedQueries map[QueryMeta][]Results) {
+	// for each query in analyzedOldQueries, get the results from the clickhouse nodes
+	// and write them to disk
+	for meta, queryResults := range analyzedQueries {
+		for _, results := range queryResults {
+			logResults := getResultsFromNode(isNew, results.queryId)
+			dir := getDirForQuery(meta, isNew)
+			fileName := fmt.Sprintf("%s/logs_%s.txt", dir, results.queryId)
+			file, err := os.Create(fileName)
+			if err != nil {
+				logger.Errorf("Error creating file: %s", err)
+				continue
+			}
+			_, _ = file.Write(logResults)
+			_ = file.Close()
+		}
+	}
+}
+
+func getDirForQuery(meta QueryMeta, isNew bool) string {
+	oldNew := "old"
+	if isNew {
+		oldNew = "new"
+	}
+	return fmt.Sprintf("results/%s/%s_%s", oldNew, meta.Table, queryTypeStr(meta.Type))
+}
+
+func getResultsFromNode(isNew bool, queryId string) []byte {
+	// execute the external command nflxlog to get the logs
+	query := "nf.env,prod,:eq,nf.app,clickhouse,:eq,:and,formattedMessage," +
+		queryId + ",:contains,:and"
+
+	if isNew {
+		return getOutFromCommand("nflxlog", "q", query, "-s", "e-30min")
+	} else {
+		return getOutFromCommand("nflxlog", "q", query, "-s", "e-30min", "--env", "test")
+	}
+}
+
+func getOutFromCommand(name string, args ...string) []byte {
+	// log the command
+	logger.Infof("Running command: %s %v", name, args)
+	cmd := exec.Command(name, args...)
+	out, err := cmd.Output()
+	if err != nil {
+		logger.Errorf("Error running command %s: %s", name, err)
+	}
+	return out
 }
