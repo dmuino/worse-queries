@@ -44,21 +44,16 @@ var connections = make(map[string]*sql.DB)
 func getConnection(node chagent.InstanceInfo) *sql.DB {
 	var db *sql.DB
 	address := fmt.Sprintf("[%s]:9000", node.IPv6Address)
-	for i := 0; i < 10; i++ {
-		db = clickhouse.OpenDB(&clickhouse.Options{
-			Addr:        []string{address},
-			DialTimeout: 5 * time.Second,
-			Protocol:    clickhouse.Native,
-		})
+	db = clickhouse.OpenDB(&clickhouse.Options{
+		Addr:        []string{address},
+		DialTimeout: 5 * time.Second,
+		Protocol:    clickhouse.Native,
+	})
 
-		err := db.Ping()
-		if err == nil {
-			logger.Infof("Connected to clickhouse-server")
-			return db
-		}
-
-		logger.Errorf("Could not connect to clickhouse-server, will retry after 5s (%d/10): %v", i+1, err)
-		time.Sleep(5 * time.Second)
+	err := db.Ping()
+	if err == nil {
+		logger.Infof("Connected to clickhouse-server")
+		return db
 	}
 	return db
 }
@@ -100,6 +95,7 @@ func getQueryLogQuery(queryId string, isNew bool) string {
 
 type Results struct {
 	queryId string
+	elapsed time.Duration
 	perHost []ResultMetadata
 }
 
@@ -133,10 +129,12 @@ func sendQueryToCluster(node chagent.InstanceInfo, isNew bool, query string) Res
 	logger.Infof("Sending query: %s to %s node %s (%s)", finalQuery, oldNew, node.InstanceId, queryId)
 
 	ctx := clickhouse.Context(context.Background(), clickhouse.WithQueryID(queryId))
+	start := time.Now()
 	res, err := conn.QueryContext(ctx, finalQuery)
 	if err != nil {
 		logger.Fatalf("Error sending query: %s", err)
 	}
+	elapsed := time.Since(start)
 	i := 0
 	for res.Next() {
 		// read all results
@@ -148,7 +146,6 @@ func sendQueryToCluster(node chagent.InstanceInfo, isNew bool, query string) Res
 	allMetadata := make([]ResultMetadata, 0)
 	// get the metadata results from system.query_log
 	meta := ResultMetadata{}
-	time.Sleep(5 * time.Second)
 	logger.Infof("Getting query log results for %s queryId: %s - %s", oldNew, queryId, finalQuery)
 	res, err = conn.Query(getQueryLogQuery(queryId, isNew))
 	if err != nil {
@@ -173,7 +170,7 @@ func sendQueryToCluster(node chagent.InstanceInfo, isNew bool, query string) Res
 	}
 
 	logger.Debugf("Done getting query log results for %s queryId: %s", oldNew, queryId)
-	return Results{queryId, allMetadata}
+	return Results{queryId, elapsed, allMetadata}
 }
 
 func analyzeQueries(node chagent.InstanceInfo, isNew bool, queries map[QueryMeta][]string) (map[QueryMeta][]Results, map[string]time.Duration) {
@@ -189,11 +186,9 @@ func analyzeQueries(node chagent.InstanceInfo, isNew bool, queries map[QueryMeta
 			oldNew,
 			queryMeta.Table, queryTypeStr(queryMeta.Type))
 		for _, query := range queryList {
-			startTime := time.Now()
 			resultMeta := sendQueryToCluster(node, isNew, query)
 			queryId := resultMeta.queryId
-			elapsed := time.Since(startTime)
-			queryTimes[queryId] = elapsed
+			queryTimes[queryId] = resultMeta.elapsed
 			result[queryMeta] = append(result[queryMeta], resultMeta)
 		}
 	}
