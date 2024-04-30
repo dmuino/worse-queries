@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"slices"
 	chagent "stash.corp.netflix.com/cldmta/clickhouse-agent-libs"
+	"strconv"
 	"time"
 )
 
@@ -94,9 +95,10 @@ func getQueryLogQuery(queryId string, isNew bool) string {
 }
 
 type Results struct {
-	queryId string
-	elapsed time.Duration
-	perHost []ResultMetadata
+	queryId    string
+	numResults int
+	elapsed    time.Duration
+	perHost    []ResultMetadata
 }
 
 func sendQueryToCluster(node chagent.InstanceInfo, isNew bool, query string) Results {
@@ -134,14 +136,14 @@ func sendQueryToCluster(node chagent.InstanceInfo, isNew bool, query string) Res
 	if err != nil {
 		logger.Fatalf("Error sending query: %s", err)
 	}
-	elapsed := time.Since(start)
-	i := 0
+	numResults := 0
 	for res.Next() {
 		// read all results
-		i++
+		numResults++
 	}
 	_ = res.Close()
-	logger.Debugf("Done sending query: %s to %s node %s. Received %d results back", finalQuery, oldNew, node.InstanceId, i)
+	elapsed := time.Since(start)
+	logger.Debugf("Done sending query: %s to %s node %s. Received %d results back", finalQuery, oldNew, node.InstanceId, numResults)
 
 	allMetadata := make([]ResultMetadata, 0)
 	// get the metadata results from system.query_log
@@ -170,12 +172,45 @@ func sendQueryToCluster(node chagent.InstanceInfo, isNew bool, query string) Res
 	}
 
 	logger.Debugf("Done getting query log results for %s queryId: %s", oldNew, queryId)
-	return Results{queryId, elapsed, allMetadata}
+	return Results{queryId, numResults, elapsed, allMetadata}
 }
 
-func analyzeQueries(node chagent.InstanceInfo, isNew bool, queries map[QueryMeta][]string) (map[QueryMeta][]Results, map[string]time.Duration) {
+type QueryStats struct {
+	numResults int
+	elapsed    time.Duration
+	hours      int
+}
+
+func getHoursFromQuery(query string) int {
+	// queries include a predicate of the form:
+	// dateTime >= toDateTime64('1714503240000000000', 9) AND dateTime <= toDateTime64('1714506900000000000', 9)
+	// we can extract the hours from the start and end times
+	// and return the difference
+	p := regexp.MustCompile(`dateTime >= toDateTime64\('(\d+)', 9\) AND dateTime <= toDateTime64\('(\d+)', 9\)`)
+	matches := p.FindStringSubmatch(query)
+	if len(matches) < 3 {
+		return -1
+	}
+	start, end := matches[1], matches[2]
+	// start is the number of nanoseconds since the epoch, convert to a time
+	startNanos, err := strconv.ParseInt(start, 10, 64)
+	if err != nil {
+		logger.Errorf("Error parsing start time: %s", err)
+		return -1
+	}
+	endNanos, err := strconv.ParseInt(end, 10, 64)
+	if err != nil {
+		logger.Errorf("Error parsing end time: %s", err)
+		return -1
+	}
+	// elapsed nanoseconds
+	hours := (endNanos - startNanos) / 1e9 / 3600
+	return int(hours)
+}
+
+func analyzeQueries(node chagent.InstanceInfo, isNew bool, queries map[QueryMeta][]string) (map[QueryMeta][]Results, map[string]QueryStats) {
 	result := make(map[QueryMeta][]Results)
-	queryTimes := make(map[string]time.Duration)
+	queryStats := make(map[string]QueryStats)
 	oldNew := "old"
 	if isNew {
 		oldNew = "new"
@@ -188,11 +223,15 @@ func analyzeQueries(node chagent.InstanceInfo, isNew bool, queries map[QueryMeta
 		for _, query := range queryList {
 			resultMeta := sendQueryToCluster(node, isNew, query)
 			queryId := resultMeta.queryId
-			queryTimes[queryId] = resultMeta.elapsed
+			queryStats[queryId] = QueryStats{
+				numResults: resultMeta.numResults,
+				elapsed:    resultMeta.elapsed,
+				hours:      getHoursFromQuery(query),
+			}
 			result[queryMeta] = append(result[queryMeta], resultMeta)
 		}
 	}
-	return result, queryTimes
+	return result, queryStats
 }
 
 func writeResults(oldNew string, results map[QueryMeta][]Results) error {
@@ -232,14 +271,23 @@ func writeResults(oldNew string, results map[QueryMeta][]Results) error {
 	return nil
 }
 
-// to avoid multiple runs hitting cached results
-func selectRandomQueries(queryList []string, max int) []string {
+func selectQueries(queryList []string, max int) []string {
 	if len(queryList) <= max {
 		return queryList
 	}
 
-	slices.Reverse(queryList)
-	return queryList[:max]
+	// filter out the queries that are over 4 hours
+	filtered := make([]string, 0)
+	for _, query := range queryList {
+		hours := getHoursFromQuery(query)
+		if hours <= 4 {
+			filtered = append(filtered, query)
+		}
+	}
+
+	toReturn := filtered[:max]
+	slices.Reverse(toReturn)
+	return toReturn
 }
 
 func main() {
@@ -274,11 +322,11 @@ func main() {
 		if queryMeta.Type == QueryTypeFilter || queryMeta.Type == QueryTypeFilterTags {
 			maxNumber *= 2
 		}
-		queries[queryMeta] = selectRandomQueries(queryList, maxNumber)
+		queries[queryMeta] = selectQueries(queryList, maxNumber)
 	}
 
-	analyzedOldQueries, oldTimes := analyzeQueries(oldNode, false, queries)
-	analyzedNewQueries, newTimes := analyzeQueries(newNode, true, queries)
+	analyzedOldQueries, oldStats := analyzeQueries(oldNode, false, queries)
+	analyzedNewQueries, newStats := analyzeQueries(newNode, true, queries)
 	for queryMeta, queryResults := range analyzedOldQueries {
 		for _, queryResult := range queryResults {
 			idsToMeta[queryResult.queryId] = queryMeta
@@ -301,20 +349,22 @@ func main() {
 	if err != nil {
 		logger.Fatalf("Error creating summary file: %s", err)
 	}
-	for queryId, oldTime := range oldTimes {
-		newTime, ok := newTimes[queryId]
+	for queryId, oldStat := range oldStats {
+		newStat, ok := newStats[queryId]
 		if !ok {
-			logger.Errorf("No time found for queryId: %s", queryId)
+			logger.Errorf("No stats found for queryId: %s", queryId)
 			continue
 		}
 		meta, ok := idsToMeta[queryId]
 		if !ok {
-			logger.Errorf("No metadata found for queryId: %s", queryId)
+			logger.Errorf("No stats found for queryId: %s", queryId)
 			continue
 		}
 		name := fmt.Sprintf("%s_%s/%s", meta.Table, queryTypeStr(meta.Type), queryId)
-		logger.Infof("Query: %s - Old: %s, New: %s", name, oldTime, newTime)
-		_, _ = file.WriteString(fmt.Sprintf("Query: %s - Old: %s, New: %s\n", name, oldTime, newTime))
+		line := fmt.Sprintf("Query: %s hours=%d - Old: %s %d, New: %s %d", name, oldStat.hours, oldStat.elapsed, oldStat.numResults, newStat.elapsed, newStat.numResults)
+		logger.Infof(line)
+		_, _ = file.WriteString(line)
+		_, _ = file.WriteString("\n")
 	}
 	_ = file.Close()
 	// sleep 1 min

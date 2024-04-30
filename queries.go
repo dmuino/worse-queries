@@ -43,9 +43,7 @@ func queryTypeStr(queryType QueryType) string {
 
 // get the query type from the query
 func getQueryType(table string, query string) QueryType {
-	if strings.HasSuffix(table, "_distributed") {
-		table = strings.TrimSuffix(table, "_distributed")
-	}
+	table = strings.TrimSuffix(table, "_distributed")
 
 	if strings.Contains(query, " STEP ") {
 		return QueryTypeTimeline
