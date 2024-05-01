@@ -17,6 +17,7 @@ import (
 
 const oldCluster = "clickhouse-logs-r1"
 const smtCluster = "clickhouse-iep"
+const numQueriesToNew = 5
 
 var logger = chagent.GetLogger("main")
 
@@ -94,11 +95,35 @@ func getQueryLogQuery(queryId string, isNew bool) string {
 		cluster, queryId)
 }
 
+type ClientElapsed struct {
+	median time.Duration
+	min    time.Duration
+	max    time.Duration
+}
+
 type Results struct {
-	queryId    string
-	numResults int
-	elapsed    time.Duration
-	perHost    []ResultMetadata
+	queryId       string
+	numResults    int
+	elapsed       ClientElapsed
+	serverElapsed time.Duration
+	perHost       []ResultMetadata
+}
+
+func sendOneQuery(conn *sql.DB, ctx context.Context, finalQuery string) (int, time.Duration) {
+	start := time.Now()
+	res, err := conn.QueryContext(ctx, finalQuery)
+	if err != nil {
+		logger.Fatalf("Error sending query: %s", err)
+	}
+	numResults := 0
+	for res.Next() {
+		// read all results
+		numResults++
+	}
+	_ = res.Close()
+	elapsed := time.Since(start)
+	logger.Debugf("Query: %s - elapsed: %s", finalQuery, elapsed)
+	return numResults, elapsed
 }
 
 func sendQueryToCluster(node chagent.InstanceInfo, isNew bool, query string) Results {
@@ -112,44 +137,42 @@ func sendQueryToCluster(node chagent.InstanceInfo, isNew bool, query string) Res
 		logger.Fatalf("Could not get a connection to the node: %v", node)
 	}
 
-	queryId, ok := queriesToIds[query]
-	if ok {
-		logger.Infof("Reusing query id %s for query: %s", queryId, query)
+	numResults := 0
+	queryId := ""
+	var clientElapsed ClientElapsed
+	if isNew {
+		// get multiple results and pick the median
+		queryId, numResults, clientElapsed = sendToNewCluster(conn, query)
 	} else {
-		queryId = uuid.NewString()
-		logger.Infof("Generated queryId %s for query: %s", queryId, query)
-		queriesToIds[query] = queryId
-		idsToQueries[queryId] = query
+		queryId, ok = queriesToIds[query]
+		if !ok {
+			logger.Fatalf("Need to send to new cluster first to generate UUID")
+		}
 	}
+	queriesToIds[query] = queryId
+	idsToQueries[queryId] = query
 
 	finalQuery := withFixedTableName(query, isNew)
-
-	oldNew := "old"
-	if isNew {
-		oldNew = "new"
+	if !isNew {
+		logger.Debugf("Sending query: %s to old node %s (%s)", finalQuery, node.InstanceId, queryId)
+		ctx := clickhouse.Context(context.Background(), clickhouse.WithQueryID(queryId))
+		var elapsed time.Duration
+		numResults, elapsed = sendOneQuery(conn, ctx, finalQuery)
+		clientElapsed = ClientElapsed{elapsed, elapsed, elapsed}
 	}
-	logger.Infof("Sending query: %s to %s node %s (%s)", finalQuery, oldNew, node.InstanceId, queryId)
-
-	ctx := clickhouse.Context(context.Background(), clickhouse.WithQueryID(queryId))
-	start := time.Now()
-	res, err := conn.QueryContext(ctx, finalQuery)
-	if err != nil {
-		logger.Fatalf("Error sending query: %s", err)
-	}
-	numResults := 0
-	for res.Next() {
-		// read all results
-		numResults++
-	}
-	_ = res.Close()
-	elapsed := time.Since(start)
-	logger.Debugf("Done sending query: %s to %s node %s. Received %d results back", finalQuery, oldNew, node.InstanceId, numResults)
 
 	allMetadata := make([]ResultMetadata, 0)
 	// get the metadata results from system.query_log
 	meta := ResultMetadata{}
+	oldNew := "old"
+	if isNew {
+		oldNew = "new"
+	}
+	// send "system flush logs" command to ensure we have query_logs
+	_, _ = conn.Exec("SYSTEM FLUSH LOGS")
+
 	logger.Infof("Getting query log results for %s queryId: %s - %s", oldNew, queryId, finalQuery)
-	res, err = conn.Query(getQueryLogQuery(queryId, isNew))
+	res, err := conn.Query(getQueryLogQuery(queryId, isNew))
 	if err != nil {
 		logger.Fatalf("Error getting query log results: %v", err)
 	}
@@ -157,6 +180,7 @@ func sendQueryToCluster(node chagent.InstanceInfo, isNew bool, query string) Res
 		_ = res.Close()
 	}(res)
 	found := false
+	serverElapsed := time.Duration(0)
 	for res.Next() {
 		found = true
 		var queryDurationMillis int
@@ -165,6 +189,7 @@ func sendQueryToCluster(node chagent.InstanceInfo, isNew bool, query string) Res
 			logger.Fatalf("Error scanning query log results: %v", err)
 		}
 		meta.queryDuration = time.Duration(queryDurationMillis) * time.Millisecond
+		serverElapsed = max(serverElapsed, meta.queryDuration)
 		allMetadata = append(allMetadata, meta)
 	}
 	if !found {
@@ -172,12 +197,38 @@ func sendQueryToCluster(node chagent.InstanceInfo, isNew bool, query string) Res
 	}
 
 	logger.Debugf("Done getting query log results for %s queryId: %s", oldNew, queryId)
-	return Results{queryId, numResults, elapsed, allMetadata}
+	return Results{queryId, numResults, clientElapsed, serverElapsed, allMetadata}
+}
+
+func sendToNewCluster(conn *sql.DB, query string) (string, int, ClientElapsed) {
+	type ElapsedUUID struct {
+		elapsed time.Duration
+		queryId string
+	}
+	numResults := 0
+	var allElapsedTimes []ElapsedUUID
+	finalQuery := withFixedTableName(query, true)
+	for i := 0; i < numQueriesToNew; i++ {
+		queryId := uuid.NewString()
+		ctx := clickhouse.Context(context.Background(), clickhouse.WithQueryID(queryId))
+		n, elapsed := sendOneQuery(conn, ctx, finalQuery)
+		numResults = max(numResults, n)
+		allElapsedTimes = append(allElapsedTimes, ElapsedUUID{elapsed, queryId})
+	}
+	slices.SortFunc(allElapsedTimes, func(i, j ElapsedUUID) int {
+		diff := i.elapsed - j.elapsed
+		return int(diff)
+	})
+	elapsed := allElapsedTimes[len(allElapsedTimes)/2]
+	minElapsed := allElapsedTimes[0].elapsed
+	maxElapsed := allElapsedTimes[len(allElapsedTimes)-1].elapsed
+	logger.Infof("Query Min: %v, Max: %v Median: %v. Query: %s", minElapsed, maxElapsed, elapsed.elapsed, finalQuery)
+	return elapsed.queryId, numResults, ClientElapsed{elapsed.elapsed, minElapsed, maxElapsed}
 }
 
 type QueryStats struct {
 	numResults int
-	elapsed    time.Duration
+	elapsed    ClientElapsed
 	hours      int
 }
 
@@ -275,19 +326,8 @@ func selectQueries(queryList []string, max int) []string {
 	if len(queryList) <= max {
 		return queryList
 	}
-
-	// filter out the queries that are over 4 hours
-	filtered := make([]string, 0)
-	for _, query := range queryList {
-		hours := getHoursFromQuery(query)
-		if hours <= 4 {
-			filtered = append(filtered, query)
-		}
-	}
-
-	toReturn := filtered[:max]
-	slices.Reverse(toReturn)
-	return toReturn
+	slices.Reverse(queryList)
+	return queryList[:max]
 }
 
 func main() {
@@ -316,7 +356,7 @@ func main() {
 			queryTypeStr(queryMeta.Type))
 	}
 
-	const MaxQueriesPerType = 3
+	const MaxQueriesPerType = 1
 	for queryMeta, queryList := range queries {
 		maxNumber := MaxQueriesPerType
 		if queryMeta.Type == QueryTypeFilter || queryMeta.Type == QueryTypeFilterTags {
@@ -325,8 +365,8 @@ func main() {
 		queries[queryMeta] = selectQueries(queryList, maxNumber)
 	}
 
-	analyzedOldQueries, oldStats := analyzeQueries(oldNode, false, queries)
 	analyzedNewQueries, newStats := analyzeQueries(newNode, true, queries)
+	analyzedOldQueries, oldStats := analyzeQueries(oldNode, false, queries)
 	for queryMeta, queryResults := range analyzedOldQueries {
 		for _, queryResult := range queryResults {
 			idsToMeta[queryResult.queryId] = queryMeta
@@ -361,19 +401,60 @@ func main() {
 			continue
 		}
 		name := fmt.Sprintf("%s_%s/%s", meta.Table, queryTypeStr(meta.Type), queryId)
-		line := fmt.Sprintf("Query: %s hours=%d - Old: %s %d, New: %s %d", name, oldStat.hours, oldStat.elapsed, oldStat.numResults, newStat.elapsed, newStat.numResults)
+		clientElapsedStr := fmt.Sprintf("Median: %s, Min: %s, Max: %s",
+			newStat.elapsed.median, newStat.elapsed.min, newStat.elapsed.max)
+		line := fmt.Sprintf("Query: %s hours=%d - Old: %s %d, New: %s %d", name, oldStat.hours, oldStat.elapsed.median,
+			oldStat.numResults, clientElapsedStr, newStat.numResults)
 		logger.Infof(line)
 		_, _ = file.WriteString(line)
 		_, _ = file.WriteString("\n")
 	}
 	_ = file.Close()
-	// sleep 1 min
 	logger.Infof("Sleeping for 1 minute to allow the logs to be written to our backend")
 	time.Sleep(1 * time.Minute)
 
 	writeLogs(false, analyzedOldQueries)
 	writeLogs(true, analyzedNewQueries)
+	writeTextLogs(newNode)
+}
 
+func writeTextLogs(node chagent.InstanceInfo) {
+	textLogQuery := `SELECT
+    query_id,
+    hostname(),
+    event_time_microseconds,
+    thread_name,
+    thread_id,
+    level,
+    query_id,
+    logger_name,
+    message
+FROM clusterAllReplicas('default', system.text_log)
+WHERE query_id IN (?)
+ORDER BY event_time_microseconds ASC`
+	conn := getConnection(node)
+
+	queryIds := make([]string, 0)
+	for queryId := range idsToQueries {
+		queryIds = append(queryIds, queryId)
+	}
+	logger.Infof("Getting text logs for %d queries: %v", len(queryIds), queryIds)
+	logger.Infof("Query: %s", textLogQuery)
+	rows, err := conn.Query(textLogQuery, queryIds)
+	if err != nil {
+		logger.Fatalf("Error getting text logs: %s", err)
+	}
+	for rows.Next() {
+		var queryId, hostname, threadName, level, loggerName, message, threadId string
+		var eventTime int64
+		err = rows.Scan(&queryId, &hostname, &eventTime, &threadName, &threadId, &level, &loggerName, &message)
+		if err != nil {
+			logger.Fatalf("Error scanning text logs: %s", err)
+		}
+		fmt.Printf("QueryId: %s, Hostname: %s, EventTime: %d, ThreadName: %s, ThreadId: %s, Level: %s, LoggerName: %s, Message: %s\n",
+			queryId, hostname, eventTime, threadName, threadId, level, loggerName, message)
+	}
+	_ = rows.Close()
 }
 
 func writeLogs(isNew bool, analyzedQueries map[QueryMeta][]Results) {
