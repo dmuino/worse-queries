@@ -227,9 +227,10 @@ func sendToNewCluster(conn *sql.DB, query string) (string, int, ClientElapsed) {
 }
 
 type QueryStats struct {
-	numResults int
-	elapsed    ClientElapsed
-	hours      int
+	numResults    int
+	elapsed       ClientElapsed
+	serverElapsed time.Duration
+	hours         int
 }
 
 func getHoursFromQuery(query string) int {
@@ -275,9 +276,10 @@ func analyzeQueries(node chagent.InstanceInfo, isNew bool, queries map[QueryMeta
 			resultMeta := sendQueryToCluster(node, isNew, query)
 			queryId := resultMeta.queryId
 			queryStats[queryId] = QueryStats{
-				numResults: resultMeta.numResults,
-				elapsed:    resultMeta.elapsed,
-				hours:      getHoursFromQuery(query),
+				numResults:    resultMeta.numResults,
+				elapsed:       resultMeta.elapsed,
+				serverElapsed: resultMeta.serverElapsed,
+				hours:         getHoursFromQuery(query),
 			}
 			result[queryMeta] = append(result[queryMeta], resultMeta)
 		}
@@ -309,6 +311,9 @@ func writeResults(oldNew string, results map[QueryMeta][]Results) error {
 			query := withFixedTableName(idsToQueries[result.queryId], isNew)
 			_, _ = file.WriteString("------------------------------\n")
 			_, _ = file.WriteString(fmt.Sprintf("Query ID: %s -- %s\n", result.queryId, query))
+			_, _ = file.WriteString(fmt.Sprintf("Num Results: %d\n", result.numResults))
+			_, _ = file.WriteString(fmt.Sprintf("Client Elapsed: %s\n", toClientElapsedStr(result.elapsed)))
+			_, _ = file.WriteString(fmt.Sprintf("Server Elapsed: %s\n", result.serverElapsed))
 			for _, r := range result.perHost {
 				_, _ = file.WriteString(fmt.Sprintf("Hostname: %s\n", r.hostname))
 				_, _ = file.WriteString(fmt.Sprintf("Read Rows: %d\n", r.readRows))
@@ -326,7 +331,6 @@ func selectQueries(queryList []string, max int) []string {
 	if len(queryList) <= max {
 		return queryList
 	}
-	slices.Reverse(queryList)
 	return queryList[:max]
 }
 
@@ -401,10 +405,9 @@ func main() {
 			continue
 		}
 		name := fmt.Sprintf("%s_%s/%s", meta.Table, queryTypeStr(meta.Type), queryId)
-		clientElapsedStr := fmt.Sprintf("Median: %s, Min: %s, Max: %s",
-			newStat.elapsed.median, newStat.elapsed.min, newStat.elapsed.max)
-		line := fmt.Sprintf("Query: %s hours=%d - Old: %s %d, New: %s %d", name, oldStat.hours, oldStat.elapsed.median,
-			oldStat.numResults, clientElapsedStr, newStat.numResults)
+		clientElapsedStr := toClientElapsedStr(newStat.elapsed)
+		line := fmt.Sprintf("Query: %s hours=%d - Old: %s %d, New: Server %s Client %s %d", name, oldStat.hours, oldStat.elapsed.median,
+			oldStat.numResults, newStat.serverElapsed, clientElapsedStr, newStat.numResults)
 		logger.Infof(line)
 		_, _ = file.WriteString(line)
 		_, _ = file.WriteString("\n")
@@ -416,6 +419,10 @@ func main() {
 	writeLogs(false, analyzedOldQueries)
 	writeLogs(true, analyzedNewQueries)
 	writeTextLogs(newNode)
+}
+
+func toClientElapsedStr(elapsed ClientElapsed) string {
+	return fmt.Sprintf("Min %s, Max %s, Median %s", elapsed.min, elapsed.max, elapsed.median)
 }
 
 func writeTextLogs(node chagent.InstanceInfo) {
