@@ -356,7 +356,7 @@ func main() {
 			queryTypeStr(queryMeta.Type))
 	}
 
-	const MaxQueriesPerType = 1
+	const MaxQueriesPerType = 4
 	for queryMeta, queryList := range queries {
 		maxNumber := MaxQueriesPerType
 		if queryMeta.Type == QueryTypeFilter || queryMeta.Type == QueryTypeFilterTags {
