@@ -327,7 +327,14 @@ func writeResults(oldNew string, results map[QueryMeta][]Results) error {
 	return nil
 }
 
-func selectQueries(queryList []string, max int) []string {
+func selectQueries(rawList []string, max int) []string {
+	queryList := make([]string, 0)
+	for _, query := range rawList {
+		// remove queries that use more than 10 hours
+		if getHoursFromQuery(query) <= 10 {
+			queryList = append(queryList, query)
+		}
+	}
 	if len(queryList) <= max {
 		return queryList
 	}
@@ -360,7 +367,7 @@ func main() {
 			queryTypeStr(queryMeta.Type))
 	}
 
-	const MaxQueriesPerType = 4
+	const MaxQueriesPerType = 2
 	for queryMeta, queryList := range queries {
 		maxNumber := MaxQueriesPerType
 		if queryMeta.Type == QueryTypeFilter || queryMeta.Type == QueryTypeFilterTags {
