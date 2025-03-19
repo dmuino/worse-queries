@@ -3,30 +3,56 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/google/uuid"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"regexp"
-	"slices"
 	chagent "stash.corp.netflix.com/cldmta/clickhouse-agent-libs"
 	"strconv"
 	"time"
 )
 
-const oldCluster = "clickhouse-logs-r1"
-const smtCluster = "clickhouse-iep"
-const numQueriesToNew = 5
+const oldAsg = "clickhouse-logs-v000"
+const newAsg = "clickhouse-logs-v001"
 
 var logger = chagent.GetLogger("main")
 
-func pickNodeFromCluster(env *chagent.NetflixEnv, slotInfo *chagent.SlotInfo, cluster string) chagent.InstanceInfo {
-	clusterInfo := slotInfo.GetAllNodesInCluster(env, cluster)
-	if len(clusterInfo) == 0 {
-		logger.Fatalf("No nodes found in cluster %s", cluster)
+func getBaseUrl(env *chagent.NetflixEnv) string {
+	return fmt.Sprintf("https://slotting-%s.%s.%s.netflix.net", env.AccountType, env.Region, env.Account)
+}
+
+func getNodesFromAsg(env *chagent.NetflixEnv, asg string) []chagent.InstanceInfo {
+	baseUrl := getBaseUrl(env)
+	url := fmt.Sprintf("%s/api/v1/autoScalingGroups/%s", baseUrl, asg)
+	logger.Debugf("Getting all nodes for asg=%s using url: %s", asg, url)
+
+	// make http get request to get all nodes in our ASG from the slotting service
+	// and return the list of nodes
+	resp, err := http.Get(url)
+	logger.CheckErr(err)
+
+	body, err := io.ReadAll(resp.Body)
+	logger.CheckErr(err)
+
+	// parse body as AsgInfo
+	var asgInfo chagent.AsgInfo
+	err = json.Unmarshal(body, &asgInfo)
+	logger.CheckErr(err)
+	return asgInfo.Instances
+}
+
+func pickNodeFromAsg(env *chagent.NetflixEnv, slotInfo *chagent.SlotInfo, asg string) chagent.InstanceInfo {
+	nodes := getNodesFromAsg(env, asg)
+	if len(nodes) == 0 {
+		logger.Fatalf("No nodes found for asg: %s", asg)
 	}
-	return clusterInfo[0]
+	// pick the first node
+	return nodes[0]
 }
 
 type ResultMetadata struct {
@@ -60,31 +86,8 @@ func getConnection(node chagent.InstanceInfo) *sql.DB {
 	return db
 }
 
-const OldSettings = "SETTINGS enable_positional_arguments = 1, log_queries = 1, skip_unavailable_shards = 1"
-const NewSettings = OldSettings +
-	", max_parallel_replicas = 70, allow_experimental_parallel_reading_from_replicas = 1" +
-	", use_hedged_requests = 0, cluster_for_parallel_replicas = 'default'"
-
-func withFixedTableName(query string, isNew bool) string {
-	// replace the table name if
-	var settings string
-	q := query
-	if isNew {
-		settings = NewSettings
-		// replace the table name with one that does not have the _distributed suffix
-		p := regexp.MustCompile(`FROM (insight_\w+)_distributed`)
-		q = p.ReplaceAllString(q, "FROM ${1}_prod")
-	} else {
-		settings = OldSettings
-	}
-	return q + " " + settings
-}
-
 func getQueryLogQuery(queryId string, isNew bool) string {
-	cluster := "default"
-	if !isNew {
-		cluster = "clickhouse_logs"
-	}
+	cluster := "clickhouse_logs"
 	return fmt.Sprintf(`SELECT hostname(),
 		read_rows,
 		read_bytes,
@@ -95,23 +98,17 @@ func getQueryLogQuery(queryId string, isNew bool) string {
 		cluster, queryId)
 }
 
-type ClientElapsed struct {
-	median time.Duration
-	min    time.Duration
-	max    time.Duration
-}
-
 type Results struct {
 	queryId       string
 	numResults    int
-	elapsed       ClientElapsed
+	elapsed       time.Duration
 	serverElapsed time.Duration
 	perHost       []ResultMetadata
 }
 
-func sendOneQuery(conn *sql.DB, ctx context.Context, finalQuery string) (int, time.Duration) {
+func sendOneQuery(conn *sql.DB, ctx context.Context, query string) (int, time.Duration) {
 	start := time.Now()
-	res, err := conn.QueryContext(ctx, finalQuery)
+	res, err := conn.QueryContext(ctx, query)
 	if err != nil {
 		logger.Fatalf("Error sending query: %s", err)
 	}
@@ -122,8 +119,58 @@ func sendOneQuery(conn *sql.DB, ctx context.Context, finalQuery string) (int, ti
 	}
 	_ = res.Close()
 	elapsed := time.Since(start)
-	logger.Debugf("Query: %s - elapsed: %s", finalQuery, elapsed)
+	logger.Debugf("Query: %s - elapsed: %s", query, elapsed)
 	return numResults, elapsed
+}
+
+// reimplements a basic StringLatin1.hashCode() from java
+func hash(s string) int32 {
+	// hash the ascii string to an int
+	n := len(s)
+	if n == 0 {
+		return 0
+	}
+	if n == 1 {
+		return int32(s[0] & 0xFF)
+	}
+
+	var h int32 = 0
+	for i := 0; i < n; i++ {
+		h = 31*h + int32(s[i]&0xFF)
+	}
+	return h
+}
+
+func getTagIndex(tag string) int {
+	// absolute value: hash(tag) % 31
+	maybeNegative := hash(tag) % 31
+	if maybeNegative < 0 {
+		return int(-maybeNegative)
+	}
+	return int(maybeNegative)
+}
+
+func splitTags(query string) string {
+	// replace tags['foo'] with tags0['foo'], tags1['foo'], etc
+	// based on the result of hash('foo') % 31
+	re := regexp.MustCompile(`tags\['([^']+)'\]`)
+	return re.ReplaceAllStringFunc(query, func(tag string) string {
+		matches := re.FindStringSubmatch(tag)
+		if len(matches) > 1 {
+			tagName := matches[1]
+			index := getTagIndex(tagName)
+			return fmt.Sprintf("tags%d['%s']", index, tagName)
+		}
+		return tag
+	})
+}
+
+func sendToNewCluster(conn *sql.DB, query string) (string, int, time.Duration) {
+	uuid := uuid.NewString()
+	ctx := clickhouse.Context(context.Background(), clickhouse.WithQueryID(uuid))
+	actualQuery := splitTags(query)
+	numResults, elapsed := sendOneQuery(conn, ctx, actualQuery)
+	return uuid, numResults, elapsed
 }
 
 func sendQueryToCluster(node chagent.InstanceInfo, isNew bool, query string) Results {
@@ -139,27 +186,20 @@ func sendQueryToCluster(node chagent.InstanceInfo, isNew bool, query string) Res
 
 	numResults := 0
 	queryId := ""
-	var clientElapsed ClientElapsed
+	var elapsed time.Duration
 	if isNew {
-		// get multiple results and pick the median
-		queryId, numResults, clientElapsed = sendToNewCluster(conn, query)
+		queryId, numResults, elapsed = sendToNewCluster(conn, query)
 	} else {
 		queryId, ok = queriesToIds[query]
 		if !ok {
-			logger.Fatalf("Need to send to new cluster first to generate UUID")
+			logger.Fatalf("Need to send to new asg first to generate UUID")
 		}
+		logger.Debugf("Sending query: %s to old node %s (%s)", query, node.InstanceId, queryId)
+		ctx := clickhouse.Context(context.Background(), clickhouse.WithQueryID(queryId))
+		numResults, elapsed = sendOneQuery(conn, ctx, query)
 	}
 	queriesToIds[query] = queryId
 	idsToQueries[queryId] = query
-
-	finalQuery := withFixedTableName(query, isNew)
-	if !isNew {
-		logger.Debugf("Sending query: %s to old node %s (%s)", finalQuery, node.InstanceId, queryId)
-		ctx := clickhouse.Context(context.Background(), clickhouse.WithQueryID(queryId))
-		var elapsed time.Duration
-		numResults, elapsed = sendOneQuery(conn, ctx, finalQuery)
-		clientElapsed = ClientElapsed{elapsed, elapsed, elapsed}
-	}
 
 	allMetadata := make([]ResultMetadata, 0)
 	// get the metadata results from system.query_log
@@ -171,7 +211,7 @@ func sendQueryToCluster(node chagent.InstanceInfo, isNew bool, query string) Res
 	// send "system flush logs" command to ensure we have query_logs
 	_, _ = conn.Exec("SYSTEM FLUSH LOGS")
 
-	logger.Infof("Getting query log results for %s queryId: %s - %s", oldNew, queryId, finalQuery)
+	logger.Infof("Getting query log results for %s queryId: %s - %s", oldNew, queryId, query)
 	res, err := conn.Query(getQueryLogQuery(queryId, isNew))
 	if err != nil {
 		logger.Fatalf("Error getting query log results: %v", err)
@@ -197,38 +237,12 @@ func sendQueryToCluster(node chagent.InstanceInfo, isNew bool, query string) Res
 	}
 
 	logger.Debugf("Done getting query log results for %s queryId: %s", oldNew, queryId)
-	return Results{queryId, numResults, clientElapsed, serverElapsed, allMetadata}
-}
-
-func sendToNewCluster(conn *sql.DB, query string) (string, int, ClientElapsed) {
-	type ElapsedUUID struct {
-		elapsed time.Duration
-		queryId string
-	}
-	numResults := 0
-	var allElapsedTimes []ElapsedUUID
-	finalQuery := withFixedTableName(query, true)
-	for i := 0; i < numQueriesToNew; i++ {
-		queryId := uuid.NewString()
-		ctx := clickhouse.Context(context.Background(), clickhouse.WithQueryID(queryId))
-		n, elapsed := sendOneQuery(conn, ctx, finalQuery)
-		numResults = max(numResults, n)
-		allElapsedTimes = append(allElapsedTimes, ElapsedUUID{elapsed, queryId})
-	}
-	slices.SortFunc(allElapsedTimes, func(i, j ElapsedUUID) int {
-		diff := i.elapsed - j.elapsed
-		return int(diff)
-	})
-	elapsed := allElapsedTimes[len(allElapsedTimes)/2]
-	minElapsed := allElapsedTimes[0].elapsed
-	maxElapsed := allElapsedTimes[len(allElapsedTimes)-1].elapsed
-	logger.Infof("Query Min: %v, Max: %v Median: %v. Query: %s", minElapsed, maxElapsed, elapsed.elapsed, finalQuery)
-	return elapsed.queryId, numResults, ClientElapsed{elapsed.elapsed, minElapsed, maxElapsed}
+	return Results{queryId, numResults, elapsed, serverElapsed, allMetadata}
 }
 
 type QueryStats struct {
 	numResults    int
-	elapsed       ClientElapsed
+	elapsed       time.Duration
 	serverElapsed time.Duration
 	hours         int
 }
@@ -267,9 +281,9 @@ func analyzeQueries(node chagent.InstanceInfo, isNew bool, queries map[QueryMeta
 	if isNew {
 		oldNew = "new"
 	}
-	// send queries to old cluster
+	// send queries to old asg
 	for queryMeta, queryList := range queries {
-		logger.Infof("Sending queries to %s cluster for table %s of type %s",
+		logger.Infof("Sending queries to %s asg for table %s of type %s",
 			oldNew,
 			queryMeta.Table, queryTypeStr(queryMeta.Type))
 		for _, query := range queryList {
@@ -308,11 +322,11 @@ func writeResults(oldNew string, results map[QueryMeta][]Results) error {
 				return err
 			}
 
-			query := withFixedTableName(idsToQueries[result.queryId], isNew)
+			query := idsToQueries[result.queryId]
 			_, _ = file.WriteString("------------------------------\n")
 			_, _ = file.WriteString(fmt.Sprintf("Query ID: %s -- %s\n", result.queryId, query))
 			_, _ = file.WriteString(fmt.Sprintf("Num Results: %d\n", result.numResults))
-			_, _ = file.WriteString(fmt.Sprintf("Client Elapsed: %s\n", toClientElapsedStr(result.elapsed)))
+			_, _ = file.WriteString(fmt.Sprintf("Client Elapsed: %s\n", result.elapsed))
 			_, _ = file.WriteString(fmt.Sprintf("Server Elapsed: %s\n", result.serverElapsed))
 			for _, r := range result.perHost {
 				_, _ = file.WriteString(fmt.Sprintf("Hostname: %s\n", r.hostname))
@@ -342,20 +356,21 @@ func selectQueries(rawList []string, max int) []string {
 }
 
 func main() {
+	logger.SetLevel(chagent.DEBUG)
 	env := chagent.NewNetflixEnv()
-	env.Environment = "prod"
-	env.Account = "iepprod"
+	env.Environment = "test"
+	env.Account = "ieptest"
 	slotInfo := chagent.NewSlotInfo(env)
 	slotInfo.SetLevel(chagent.DEBUG)
 
 	// get one node for the old deployment
-	oldNode := pickNodeFromCluster(env, slotInfo, oldCluster)
+	oldNode := pickNodeFromAsg(env, slotInfo, oldAsg)
 	logger.Infof("Will use node %s for old deployment", oldNode.InstanceId)
 
-	newNode := pickNodeFromCluster(env, slotInfo, smtCluster)
+	newNode := pickNodeFromAsg(env, slotInfo, newAsg)
 	logger.Infof("Will use node %s for new deployment", newNode.InstanceId)
 
-	// read all queries to be sent to both clusters
+	// read all queries to be sent to both asgs
 	queries, err := ReadQueries("queries.txt")
 	if err != nil {
 		logger.Fatalf("Error reading queries: %s", err)
@@ -412,14 +427,14 @@ func main() {
 			continue
 		}
 		name := fmt.Sprintf("%s_%s/%s", meta.Table, queryTypeStr(meta.Type), queryId)
-		clientElapsedStr := toClientElapsedStr(newStat.elapsed)
-		tooSlow := newStat.serverElapsed.Nanoseconds() > oldStat.elapsed.median.Nanoseconds()*3 && newStat.serverElapsed > 1*time.Second
+		clientElapsedStr := fmt.Sprintf("%s", newStat.elapsed)
+		tooSlow := oldStat.serverElapsed.Nanoseconds() > newStat.elapsed.Nanoseconds()*2
 		interesting := oldStat.numResults != newStat.numResults || tooSlow
 		interestingStr := ""
 		if interesting {
 			interestingStr = ">>>> "
 		}
-		line := fmt.Sprintf("%sQuery: %s hours=%d - Old: %s %d, New: Server %s Client %s %d", interestingStr, name, oldStat.hours, oldStat.elapsed.median,
+		line := fmt.Sprintf("%sQuery: %s hours=%d - Old: %s %d, New: Server %s Client %s %d", interestingStr, name, oldStat.hours, oldStat.elapsed,
 			oldStat.numResults, newStat.serverElapsed, clientElapsedStr, newStat.numResults)
 		if interesting || newStat.serverElapsed >= 1*time.Second {
 			logger.Infof(line)
@@ -436,10 +451,6 @@ func main() {
 	writeTextLogs(newNode)
 }
 
-func toClientElapsedStr(elapsed ClientElapsed) string {
-	return fmt.Sprintf("Min %s, Max %s, Median %s", elapsed.min, elapsed.max, elapsed.median)
-}
-
 func writeTextLogs(node chagent.InstanceInfo) {
 	textLogQuery := `SELECT
     query_id,
@@ -451,7 +462,7 @@ func writeTextLogs(node chagent.InstanceInfo) {
     query_id,
     logger_name,
     message
-FROM clusterAllReplicas('default', system.text_log)
+FROM clusterAllReplicas('clickhouse_logs', system.text_log)
 WHERE query_id IN (?)
 ORDER BY event_time_microseconds ASC`
 	conn := getConnection(node)
@@ -508,7 +519,7 @@ func getDirForQuery(meta QueryMeta, isNew bool) string {
 
 func getResultsFromNode(isNew bool, queryId string) []byte {
 	// execute the external command nflxlog to get the logs
-	query := "nf.env,prod,:eq,nf.app,clickhouse,:eq,:and,formattedMessage," +
+	query := "nf.env,test,:eq,nf.app,clickhouse,:eq,:and,formattedMessage," +
 		queryId + ",:contains,:and"
 
 	if isNew {
